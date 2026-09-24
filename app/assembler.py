@@ -13,6 +13,10 @@
 每一步（合并第 k 段，k 从 1 开始）只有在最高对齐得分大于 0、且至少有 2 对
 相同已知字（``match`` 列）时才继续，否则抛出 :class:`AssemblyError`，
 由接口层转为 422；拼接为纯内存计算，失败即不返回任何结果。
+
+:func:`assemble_detail` 与 :func:`assemble` 的拼接过程完全相同，额外返回
+每步对齐得分与累计得分，供需要比较多种拼接顺序的调用方（如 ``orderer``）
+使用。
 """
 
 from __future__ import annotations
@@ -39,8 +43,11 @@ def _merge_once(
     cur_sources: list[list[dict]],
     nxt: str,
     seg_index: int,
-) -> tuple[str, list[list[dict]]]:
-    """将当前拼接文本与第 ``seg_index`` 段对齐合并，返回 (新文本, 新逐字来源)。"""
+) -> tuple[str, list[list[dict]], int]:
+    """将当前拼接文本与第 ``seg_index`` 段对齐合并。
+
+    返回 (新文本, 新逐字来源, 本步最高对齐得分)。
+    """
     r = align(cur_text, nxt)
     same_known_pairs = sum(1 for c in r["columns"] if c["type"] == "match")
     if r["score"] < MIN_SCORE or same_known_pairs < MIN_SAME_KNOWN_PAIRS:
@@ -79,14 +86,14 @@ def _merge_once(
     for p in range(end_j, len(nxt)):
         emit(nxt[p], [{"segment": seg_index, "pos": p}])
 
-    return "".join(out_chars), out_sources
+    return "".join(out_chars), out_sources, r["score"]
 
 
-def assemble(segments: list[str]) -> dict:
-    """按阅读顺序拼接 2～5 段转写，返回 ``{"text": ..., "sources": ...}``。
+def assemble_detail(segments: list[str]) -> dict:
+    """按给定顺序拼接，返回文本、逐字来源及各步/累计对齐得分。
 
-    失败时抛出 :class:`AssemblyError`（``failed_segment`` 为失败段序号，
-    从 0 开始）。
+    返回 ``{"text", "sources", "step_scores", "total_score"}``；拼接过程、
+    续接门槛与失败行为与 :func:`assemble` 完全一致。
     """
     if len(segments) < 2:
         raise ValueError("至少需要 2 段转写")
@@ -95,6 +102,23 @@ def assemble(segments: list[str]) -> dict:
     sources: list[list[dict]] = [
         [{"segment": 0, "pos": p}] for p in range(len(text))
     ]
+    step_scores: list[int] = []
     for k in range(1, len(segments)):
-        text, sources = _merge_once(text, sources, segments[k], k)
-    return {"text": text, "sources": sources}
+        text, sources, score = _merge_once(text, sources, segments[k], k)
+        step_scores.append(score)
+    return {
+        "text": text,
+        "sources": sources,
+        "step_scores": step_scores,
+        "total_score": sum(step_scores),
+    }
+
+
+def assemble(segments: list[str]) -> dict:
+    """按阅读顺序拼接 2～5 段转写，返回 ``{"text": ..., "sources": ...}``。
+
+    失败时抛出 :class:`AssemblyError`（``failed_segment`` 为失败段序号，
+    从 0 开始）。
+    """
+    r = assemble_detail(segments)
+    return {"text": r["text"], "sources": r["sources"]}

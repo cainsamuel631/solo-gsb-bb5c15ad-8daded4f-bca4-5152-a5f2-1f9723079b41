@@ -190,3 +190,67 @@ def test_collate_reuses_assemble_segment_limits():
     assert client.post("/api/collate", json={"segments": ["abc", ""]}).status_code == 422
     # 缺字段
     assert client.post("/api/collate", json={}).status_code == 422
+
+
+def test_order_endpoint_recovers_reading_order():
+    resp = client.post(
+        "/api/order",
+        json={"segments": ["时习之不", "学而?习之", "之不亦乐乎"]},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["order"] == [1, 0, 2]
+    assert data["text"] == "学而时习之不亦乐乎"
+    assert data["step_scores"] == [4, 4]
+    assert data["total_score"] == 8
+    sources = data["sources"]
+    assert len(sources) == len(data["text"])
+    # 来源按原输入下标标记："时" 由原输入第 0 段补入第 1 段的 "?"
+    assert sources[2] == [{"segment": 0, "pos": 0}, {"segment": 1, "pos": 2}]
+    assert sources[4] == [
+        {"segment": 0, "pos": 2},
+        {"segment": 1, "pos": 4},
+        {"segment": 2, "pos": 0},
+    ]
+
+
+def test_order_tie_returns_409_with_all_tied_orders():
+    resp = client.post("/api/order", json={"segments": ["甲乙丙丁", "甲乙丙丁"]})
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["total_score"] == 8
+    assert [o["order"] for o in detail["orders"]] == [[0, 1], [1, 0]]
+    for o in detail["orders"]:
+        assert o["text"] == "甲乙丙丁"
+        assert o["total_score"] == 8
+
+
+def test_order_no_complete_order_returns_422():
+    resp = client.post(
+        "/api/order",
+        json={"segments": ["孔子曰未知", "未知生焉", "完全无关文本"]},
+    )
+    assert resp.status_code == 422
+
+
+def test_order_segment_limits():
+    # 段数不足 / 超上限（2～4 段）
+    assert client.post("/api/order", json={"segments": ["abc"]}).status_code == 422
+    assert client.post(
+        "/api/order",
+        json={"segments": ["aa", "bb", "cc", "dd", "ee"]},
+    ).status_code == 422
+    # 单段超 100 字
+    assert client.post(
+        "/api/order",
+        json={"segments": ["a" * 100, "b" * 101]},
+    ).status_code == 422
+    # 总长超 240 字
+    assert client.post(
+        "/api/order",
+        json={"segments": ["字" * 100, "字" * 100, "字" * 41]},
+    ).status_code == 422
+    # 空段
+    assert client.post("/api/order", json={"segments": ["abc", ""]}).status_code == 422
+    # 缺字段
+    assert client.post("/api/order", json={}).status_code == 422

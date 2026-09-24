@@ -6,6 +6,8 @@
   后缀-前缀对齐拼接，并返回最终文本与逐字来源列表。
 - ``POST /api/collate``：沿用 ``/api/assemble`` 的请求限制与续接门槛复用其
   拼接文本和逐字来源，逐位置回查所有来源原字做段级投票，供校勘人员复核异文。
+- ``POST /api/order``：提交 2～4 段未排序转写，穷举可行阅读顺序，按累计
+  对齐得分选出最优完整顺序，返回原输入下标顺序、拼接文本与逐字来源。
 """
 
 from fastapi import FastAPI, HTTPException
@@ -14,11 +16,16 @@ from pydantic import BaseModel, Field, model_validator
 from .aligner import align
 from .assembler import AssemblyError, assemble
 from .collator import collate
+from .orderer import NoViableOrderError, TiedOrderError, order
 
 MAX_TEXT_LEN = 500   # 单段文本最大长度（残页转写通常远小于此）
 MAX_SEGMENTS = 5     # /api/assemble 最大段数
 MIN_SEGMENTS = 2     # /api/assemble 最小段数
 MAX_TOTAL_LEN = 800  # /api/assemble 各段总长上限
+
+ORDER_MAX_SEGMENTS = 4    # /api/order 最大段数
+ORDER_MAX_TEXT_LEN = 100  # /api/order 单段最大长度
+ORDER_MAX_TOTAL_LEN = 240  # /api/order 各段总长上限
 
 app = FastAPI(
     title="古籍残页转写拼接 API",
@@ -183,6 +190,43 @@ class CollateResponse(BaseModel):
     )
 
 
+class OrderRequest(BaseModel):
+    """未排序多段拼接请求。"""
+
+    segments: list[str] = Field(
+        ...,
+        min_length=MIN_SEGMENTS,
+        max_length=ORDER_MAX_SEGMENTS,
+        description="未排序的转写文本（2～4 段），未辨认字以 ? 表示",
+        examples=[["时习之不", "学而?习之", "之不亦乐乎"]],
+    )
+
+    @model_validator(mode="after")
+    def _validate_segments(self):
+        for idx, seg in enumerate(self.segments):
+            if len(seg) < 1:
+                raise ValueError(f"第 {idx + 1} 段文本不能为空")
+            if len(seg) > ORDER_MAX_TEXT_LEN:
+                raise ValueError(f"第 {idx + 1} 段文本超过 {ORDER_MAX_TEXT_LEN} 字")
+        total = sum(len(seg) for seg in self.segments)
+        if total > ORDER_MAX_TOTAL_LEN:
+            raise ValueError(f"各段文本总长 {total} 字，超过 {ORDER_MAX_TOTAL_LEN} 字上限")
+        return self
+
+
+class OrderResult(BaseModel):
+    """一种完整阅读顺序的拼接结果。"""
+
+    order: list[int] = Field(..., description="阅读顺序（原输入下标，从 0 开始）")
+    text: str = Field(..., description="按该顺序拼接的文本")
+    sources: list[list[CharSource]] = Field(
+        ...,
+        description="逐字来源列表，与 text 等长；段序号为原输入下标",
+    )
+    step_scores: list[int] = Field(..., description="各步对齐得分（按阅读顺序）")
+    total_score: int = Field(..., description="累计对齐得分（各步得分之和）")
+
+
 @app.get("/", summary="服务信息")
 def index():
     return {
@@ -190,6 +234,7 @@ def index():
         "align": "POST /api/align",
         "assemble": "POST /api/assemble",
         "collate": "POST /api/collate",
+        "order": "POST /api/order",
         "docs": "/docs",
         "health": "/health",
     }
@@ -264,5 +309,38 @@ def api_collate(req: AssembleRequest):
             detail={
                 "message": str(exc),
                 "failed_segment": exc.failed_segment,
+            },
+        ) from exc
+
+
+@app.post(
+    "/api/order",
+    response_model=OrderResult,
+    status_code=200,
+    summary="穷举 2～4 段未排序残页转写的阅读顺序",
+    description=(
+        "每段最长 100 字、总长最长 240 字。穷举全部排列作为候选阅读顺序，"
+        "每种顺序逐段复用后缀-前缀对齐：将当前拼接文本与下一原段合并，沿用"
+        "续接门槛（每步最高对齐得分 > 0 且至少 2 对相同已知字），累计各步"
+        "对齐得分；任何一步不满足门槛即放弃该顺序。取累计得分最高的完整顺序，"
+        "返回原输入下标顺序、拼接文本与按原输入下标标记的逐字来源。"
+        "最高分并列时返回 409 及全部并列顺序；无完整顺序时返回 422。"
+    ),
+)
+def api_order(req: OrderRequest):
+    try:
+        return order(req.segments)
+    except NoViableOrderError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": str(exc)},
+        ) from exc
+    except TiedOrderError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "total_score": exc.total_score,
+                "orders": exc.orders,
             },
         ) from exc
