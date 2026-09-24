@@ -34,13 +34,17 @@ class AssemblyError(ValueError):
         )
 
 
-def _merge_once(
+def merge_once(
     cur_text: str,
     cur_sources: list[list[dict]],
     nxt: str,
     seg_index: int,
-) -> tuple[str, list[list[dict]]]:
-    """将当前拼接文本与第 ``seg_index`` 段对齐合并，返回 (新文本, 新逐字来源)。"""
+) -> tuple[str, list[list[dict]], int]:
+    """将当前拼接文本与第 ``seg_index`` 段对齐合并一步。
+
+    返回 (新文本, 新逐字来源, 本步对齐得分)。不满足续接门槛时抛出
+    :class:`AssemblyError`。
+    """
     r = align(cur_text, nxt)
     same_known_pairs = sum(1 for c in r["columns"] if c["type"] == "match")
     if r["score"] < MIN_SCORE or same_known_pairs < MIN_SAME_KNOWN_PAIRS:
@@ -79,7 +83,7 @@ def _merge_once(
     for p in range(end_j, len(nxt)):
         emit(nxt[p], [{"segment": seg_index, "pos": p}])
 
-    return "".join(out_chars), out_sources
+    return "".join(out_chars), out_sources, r["score"]
 
 
 def assemble(segments: list[str]) -> dict:
@@ -96,5 +100,5 @@ def assemble(segments: list[str]) -> dict:
         [{"segment": 0, "pos": p}] for p in range(len(text))
     ]
     for k in range(1, len(segments)):
-        text, sources = _merge_once(text, sources, segments[k], k)
+        text, sources, _score = merge_once(text, sources, segments[k], k)
     return {"text": text, "sources": sources}

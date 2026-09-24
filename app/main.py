@@ -6,6 +6,9 @@
   后缀-前缀对齐拼接，并返回最终文本与逐字来源列表。
 - ``POST /api/collate``：沿用 ``/api/assemble`` 的请求限制与续接门槛复用其
   拼接文本和逐字来源，逐位置回查所有来源原字做段级投票，供校勘人员复核异文。
+- ``POST /api/order``：提交 2～4 段**未排序**转写（单段不超过 100 字、总长不
+  超过 240 字），穷举全部排列，逐段复用上述续接门槛与累计对齐得分选出阅读
+  顺序，返回原输入下标顺序、拼接文本与按原输入下标标记的逐字来源。
 """
 
 from fastapi import FastAPI, HTTPException
@@ -14,6 +17,19 @@ from pydantic import BaseModel, Field, model_validator
 from .aligner import align
 from .assembler import AssemblyError, assemble
 from .collator import collate
+from .orderer import (
+    MAX_SEGMENT_LEN as ORDER_MAX_SEGMENT_LEN,
+)
+from .orderer import (
+    MAX_SEGMENTS as ORDER_MAX_SEGMENTS,
+)
+from .orderer import (
+    MAX_TOTAL_LEN as ORDER_MAX_TOTAL_LEN,
+)
+from .orderer import (
+    MIN_SEGMENTS as ORDER_MIN_SEGMENTS,
+)
+from .orderer import NoCompleteOrderError, OrderTieError, determine_order
 
 MAX_TEXT_LEN = 500   # 单段文本最大长度（残页转写通常远小于此）
 MAX_SEGMENTS = 5     # /api/assemble 最大段数
@@ -183,6 +199,50 @@ class CollateResponse(BaseModel):
     )
 
 
+class OrderRequest(BaseModel):
+    """未排序多段转写的排序请求。"""
+
+    segments: list[str] = Field(
+        ...,
+        min_length=ORDER_MIN_SEGMENTS,
+        max_length=ORDER_MAX_SEGMENTS,
+        description="未排序的转写文本（2～4 段），未辨认字以 ? 表示",
+        examples=[["之不亦乐乎", "学而?习之", "时习之不"]],
+    )
+
+    @model_validator(mode="after")
+    def _validate_segments(self):
+        for idx, seg in enumerate(self.segments):
+            if len(seg) < 1:
+                raise ValueError(f"第 {idx + 1} 段文本不能为空")
+            if len(seg) > ORDER_MAX_SEGMENT_LEN:
+                raise ValueError(f"第 {idx + 1} 段文本超过 {ORDER_MAX_SEGMENT_LEN} 字")
+        total = sum(len(seg) for seg in self.segments)
+        if total > ORDER_MAX_TOTAL_LEN:
+            raise ValueError(f"各段文本总长 {total} 字，超过 {ORDER_MAX_TOTAL_LEN} 字上限")
+        return self
+
+
+class OrderResult(BaseModel):
+    """一个完整阅读顺序及其拼接结果。"""
+
+    order: list[int] = Field(
+        ...,
+        description="阅读顺序，以原输入下标表示（从 0 开始）",
+    )
+    score: int = Field(..., description="该顺序各步对齐得分的累计总分")
+    text: str = Field(..., description="按该顺序拼接得到的文本")
+    sources: list[list[CharSource]] = Field(
+        ...,
+        description="逐字来源列表，与 text 等长；段序号按原输入下标标记，"
+                    "规则与 /api/assemble 一致",
+    )
+
+
+class OrderResponse(OrderResult):
+    """唯一最高分时的排序结果。"""
+
+
 @app.get("/", summary="服务信息")
 def index():
     return {
@@ -190,6 +250,7 @@ def index():
         "align": "POST /api/align",
         "assemble": "POST /api/assemble",
         "collate": "POST /api/collate",
+        "order": "POST /api/order",
         "docs": "/docs",
         "health": "/health",
     }
@@ -265,4 +326,79 @@ def api_collate(req: AssembleRequest):
                 "message": str(exc),
                 "failed_segment": exc.failed_segment,
             },
+        ) from exc
+
+
+@app.post(
+    "/api/order",
+    response_model=OrderResponse,
+    status_code=200,
+    summary="穷举 2～4 段未排序转写的可行阅读顺序",
+    description=(
+        "单段最长 100 字、总长最长 240 字。穷举全部排列（至多 4! = 24 种），"
+        "每一步把当前拼接文本与下一原段交给现有后缀-前缀对齐逻辑，沿用续接门槛"
+        "（最高对齐得分 > 0 且至少 2 对相同已知字，否则废弃该排列），累计各步"
+        "对齐得分作为该顺序总分（不按原段两两相似度排序）。取累计得分最高的"
+        "完整顺序，返回原输入下标顺序、拼接文本及按原输入下标标记的逐字来源，"
+        "拼接/来源规则与 /api/assemble 一致。最高分并列时返回 **409** 并给出全部"
+        "并列顺序；不存在任何完整顺序时返回 **422**。"
+    ),
+    responses={
+        409: {
+            "description": "最高累计得分存在多个并列的完整顺序",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "最高累计得分 8 的完整顺序有 2 个并列，无法唯一确定阅读顺序",
+                            "score": 8,
+                            "ties": [
+                                {
+                                    "order": [0, 1, 2],
+                                    "score": 8,
+                                    "text": "…",
+                                    "sources": [[{"segment": 0, "pos": 0}]],
+                                },
+                                {
+                                    "order": [0, 2, 1],
+                                    "score": 8,
+                                    "text": "…",
+                                    "sources": [[{"segment": 0, "pos": 0}]],
+                                },
+                            ],
+                        }
+                    }
+                }
+            },
+        },
+        422: {
+            "description": "不存在任何完整顺序（或请求参数不合法）",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "没有任何排列能通过续接门槛（每步最高对齐得分 > 0 且至少 2 对相同已知字），无法确定完整阅读顺序"
+                        }
+                    }
+                }
+            },
+        },
+    },
+)
+def api_order(req: OrderRequest):
+    try:
+        return determine_order(req.segments)
+    except OrderTieError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "score": exc.score,
+                "ties": exc.tied,
+            },
+        ) from exc
+    except NoCompleteOrderError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": str(exc)},
         ) from exc

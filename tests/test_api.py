@@ -190,3 +190,92 @@ def test_collate_reuses_assemble_segment_limits():
     assert client.post("/api/collate", json={"segments": ["abc", ""]}).status_code == 422
     # 缺字段
     assert client.post("/api/collate", json={}).status_code == 422
+
+
+def test_order_endpoint_recovers_order():
+    resp = client.post(
+        "/api/order",
+        json={"segments": ["之不亦乐乎", "学而?习之", "时习之不"]},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["order"] == [1, 2, 0]
+    assert data["score"] == 8
+    assert data["text"] == "学而时习之不亦乐乎"
+    assert len(data["sources"]) == len(data["text"])
+    # 来源按原输入下标标记：首字仅来自原下标 1 的段
+    assert data["sources"][0] == [{"segment": 1, "pos": 0}]
+
+
+def test_order_endpoint_accepts_four_segments():
+    resp = client.post(
+        "/api/order",
+        json={
+            "segments": [
+                "乐乎有朋自远方来",
+                "时习之不",
+                "学而?习之",
+                "之不亦乐乎",
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["order"] == [2, 1, 3, 0]
+    assert data["text"] == "学而时习之不亦乐乎有朋自远方来"
+
+
+def test_order_tie_returns_409_with_all_orders():
+    resp = client.post(
+        "/api/order",
+        json={"segments": ["甲乙丙丁", "丙丁戊", "丙丁戊"]},
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["score"] == 10
+    assert [t["order"] for t in detail["ties"]] == [[0, 1, 2], [0, 2, 1]]
+    for t in detail["ties"]:
+        assert t["score"] == 10
+        assert t["text"] == "甲乙丙丁戊"
+        assert len(t["sources"]) == len(t["text"])
+
+
+def test_order_no_complete_order_returns_422():
+    resp = client.post(
+        "/api/order",
+        json={"segments": ["孔子曰未知", "完全无关文本甲", "另一无关内容乙"]},
+    )
+    assert resp.status_code == 422
+    assert "message" in resp.json()["detail"]
+
+
+def test_order_segment_limits_validated():
+    # 段数不足 / 超上限（2～4 段）
+    assert client.post("/api/order", json={"segments": ["abc"]}).status_code == 422
+    assert client.post(
+        "/api/order",
+        json={"segments": ["aa", "bb", "cc", "dd", "ee"]},
+    ).status_code == 422
+    # 单段超过 100 字
+    assert client.post(
+        "/api/order",
+        json={"segments": ["a" * 101, "bb"]},
+    ).status_code == 422
+    # 总长超过 240 字
+    assert client.post(
+        "/api/order",
+        json={"segments": ["字" * 90, "字" * 90, "字" * 61]},
+    ).status_code == 422
+    # 空段 / 缺字段
+    assert client.post("/api/order", json={"segments": ["abc", ""]}).status_code == 422
+    assert client.post("/api/order", json={}).status_code == 422
+
+
+def test_order_boundary_lengths_accepted():
+    # 单段恰好 100 字、总长恰好 240 字可通过参数校验
+    resp = client.post(
+        "/api/order",
+        json={"segments": ["字" * 100, "字" * 100, "字" * 40]},
+    )
+    # 参数合法；三段同为重复字，排列必有并列 -> 409
+    assert resp.status_code == 409
